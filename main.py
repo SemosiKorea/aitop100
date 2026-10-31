@@ -234,8 +234,6 @@ async def webhook(request: Request, background_tasks: BackgroundTasks, x_bot_sec
         raise HTTPException(status_code=400, detail="Invalid payload")
     if payload.get("op") == 0 and payload.get("t") == "MESSAGE_CREATE" and isinstance(payload.get("d"), dict):
         data = payload["d"]
-        if data.get("isChannelChatroom") is True:
-            return Response(status_code=204)
         question, callback = data.get("content"), data.get("callbackToken")
         if isinstance(question, str) and question.strip() and len(question) <= 2000 and isinstance(callback, str) and callback:
             sid = sender_id(data) or secrets.token_hex(12)

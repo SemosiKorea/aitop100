@@ -1,7 +1,7 @@
 import asyncio
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 from fastapi.testclient import TestClient
@@ -20,6 +20,13 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(client.get("/health").status_code, 200)
             self.assertEqual(client.post("/webhook", json={}).status_code, 401)
             self.assertEqual(client.post("/webhook", headers={"X-Bot-Secret": "secret"}, json={}).status_code, 204)
+
+    def test_channel_one_to_one_starts_reply(self):
+        event = {"op": 0, "t": "MESSAGE_CREATE", "d": {"isChannelChatroom": True, "content": "L-60 할인 조건 알려주세요", "callbackToken": "callback", "botUserKey": "user-1"}}
+        with patch.dict(os.environ, {"KAKAO_WEBHOOK_SECRET": "secret"}), patch.object(main, "process_message", new_callable=AsyncMock) as task:
+            client = TestClient(main.app)
+            self.assertEqual(client.post("/webhook", headers={"X-Bot-Secret": "secret"}, json=event).status_code, 204)
+            task.assert_awaited_once_with("L-60 할인 조건 알려주세요", "callback", "user-1", "L-60")
 
     def test_case_id_and_reset_allowlist(self):
         self.assertEqual(main.case_id_from({"d": {}}, "사례 R-05-a"), "R-05-a")
