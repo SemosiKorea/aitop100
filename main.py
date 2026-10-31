@@ -25,6 +25,7 @@ SEEN_TARGETS = defaultdict(set)
 LOCKS = defaultdict(asyncio.Lock)
 ADDRESS_STATES = {}
 RECEIPT_STATES = {}
+MOLD_STATES = {}
 
 def operations():
     result = {}
@@ -65,6 +66,8 @@ def case_id_from(payload, question):
             return "L-03"
         if "현금영수증" in question and "지난주" in question:
             return "L-05"
+        if "곰팡이" in question and ("수박" in question or "오늘 열" in question):
+            return "L-11"
         return None
     parts = found.group().split("-")
     return "-".join([parts[0].upper(), parts[1]] + ([parts[2].lower()] if len(parts) == 3 else []))
@@ -285,6 +288,90 @@ async def handle_l05(question, sid, history):
         return f"요청하신 {state['receipt_no']} 번호로 {state['receipt_type']} 현금영수증 발행 요청이 접수됐습니다."
     return "현금영수증 발행 요청은 접수됐습니다. 다른 문의가 있으면 알려주세요."
 
+async def handle_l11(question, sid, history):
+    state = MOLD_STATES.setdefault(sid, {"stage": "triage", "request_text": question})
+    if state["stage"] == "done":
+        return "환불 신청과 동일 로트 안전 확인 요청이 접수됐습니다."
+    if state["stage"] == "blocked":
+        return "기록이 일치하지 않아 환불 신청을 접수할 수 없습니다. 담당자 확인이 필요합니다."
+    if state["stage"] == "claim":
+        return "섭취 후 증상 관련 정식 클레임이 담당자에게 접수됐습니다. 상품·포장을 보관해 주세요."
+    if state["stage"] == "triage":
+        order = re.search(r"(?<!\d)\d{9}(?!\d)", question)
+        if order:
+            state["order"] = order.group()
+        if re.search(r"(먹지|안\s*먹|섭취하지|섭취\s*안)", question):
+            state["ate"] = False
+        elif re.search(r"(먹었|섭취했)", question):
+            state["ate"] = True
+        if re.search(r"(이상\s*없|증상\s*없|괜찮)", question):
+            state["symptoms"] = False
+        elif re.search(r"(아프|복통|구토|설사|어지럽|이상\s*있)", question):
+            state["symptoms"] = True
+        if "환불" in question:
+            state["choice"] = "refund"
+        elif "재배송" in question:
+            state["choice"] = "redelivery"
+        if re.search(r"(서늘|냉장|상온|실온|직사광|고온)", question):
+            state["storage"] = question.strip()
+        if "order" not in state:
+            return "불편을 드려 죄송합니다. 곰팡이 핀 수박은 드시지 마세요. 드셨거나 몸에 이상은 없으신가요? 대상 주문번호도 알려주세요."
+        if "ate" not in state or "symptoms" not in state:
+            return f"{state['order']} 주문이 맞나요? 수박을 드셨는지와 현재 몸에 이상이 있는지 알려주세요. 상품·포장은 우선 보관하고 사진을 남겨주세요."
+        if state["ate"] or state["symptoms"]:
+            reason = f"주문 {state['order']} 곰팡이 수박 신고, 섭취 또는 이상 증상 가능성. 인과관계 미확정. 상품·포장 보관 및 사진 안내 후 정식 클레임 확인 요청."
+            claim = await call_action({"operation_id": "API-35", "path_params": {}, "query": {}, "body": {"lane": "LANE3_CLAIM", "reason": reason}}, "L-11", history, SEEN_TARGETS[sid])
+            if not isinstance(claim, dict) or claim.get("request_status") != "SUBMITTED" or not claim.get("escalation_id"):
+                return "섭취 후 이상 가능성이 있어 상품·포장을 보관하고 사진을 남겨주세요. 정식 클레임 접수 확인이 필요합니다."
+            state["stage"] = "claim"
+            return f"상품·포장을 보관하고 사진을 남겨주세요. 정식 클레임 확인 요청이 접수됐습니다(이관번호 {claim['escalation_id']}). 인과관계는 담당자가 확인합니다."
+        if "storage" not in state:
+            return "수령한 뒤 수박을 어떻게 보관하셨나요? 상자째 서늘한 곳에 두셨는지 등 보관 상태를 알려주세요. 사진도 남겨주세요."
+        if re.search(r"(상온|실온|직사광|고온)", state["storage"]):
+            state["stage"] = "blocked"
+            return "보관 상태와 하자 원인을 더 확인해야 해 전액환불을 바로 접수할 수 없습니다. 사진과 기록을 함께 검토하겠습니다."
+        if "choice" not in state:
+            return f"{state['order']} 주문의 곰팡이 수박이 맞나요? 드시지 말고 상품 사진을 남겨주세요. 재배송과 전액환불 중 원하시는 처리를 알려주세요."
+        if state["choice"] != "refund":
+            state["stage"] = "blocked"
+            return "재배송을 선택하셨습니다. 이 사례의 환불 신청은 접수하지 않겠습니다."
+        state["stage"] = "confirm"
+        return f"{state['order']} 주문의 곰팡이 수박을 원결제수단으로 전액환불 신청하시겠습니까? 맞으면 '네'라고 답해주세요."
+    if state["stage"] == "confirm":
+        if not re.fullmatch(r"\s*(?:네|예|맞아요|맞습니다)[.!]?\s*", question):
+            return "환불을 신청할 대상 주문번호와 처리 의사를 다시 확인해 주세요."
+        order_no = state["order"]
+        shipment = await call_action({"operation_id": "API-11", "path_params": {}, "query": {"order_no": order_no}, "body": {}}, "L-11", history, SEEN_TARGETS[sid])
+        lot_id = "KD-WTM-370624-03"
+        if not isinstance(shipment, list) or len(shipment) != 1 or shipment[0].get("order_no") != order_no or shipment[0].get("status") != "DELIVERED" or not any(i.get("lot_id") == lot_id for i in shipment[0].get("items", [])):
+            state["stage"] = "blocked"
+            return "주문·배송·로트 기록을 일치하게 확인하지 못해 환불 신청을 접수할 수 없습니다."
+        try:
+            delivered = datetime.fromisoformat(shipment[0]["delivered_at"].replace("Z", "+00:00")).date()
+        except (KeyError, AttributeError, ValueError):
+            state["stage"] = "blocked"
+            return "수령일을 확인하지 못해 환불 신청을 접수할 수 없습니다."
+        if not 0 <= (date(2037, 6, 30) - delivered).days <= 7:
+            state["stage"] = "blocked"
+            return "수령 후 신고 기한을 확인할 수 없어 환불 신청을 접수할 수 없습니다."
+        lot = await call_action({"operation_id": "API-03", "path_params": {"lot_id": lot_id}, "query": {}, "body": {}}, "L-11", history, SEEN_TARGETS[sid])
+        investigation = await call_action({"operation_id": "API-04", "path_params": {"lot_id": lot_id}, "query": {}, "body": {}}, "L-11", history, SEEN_TARGETS[sid])
+        tickets = await call_action({"operation_id": "API-06", "path_params": {}, "query": {"lot_id": lot_id}, "body": {}}, "L-11", history, SEEN_TARGETS[sid])
+        if not isinstance(lot, dict) or lot.get("lot_id") != lot_id or not isinstance(tickets, list) or not isinstance(investigation, dict) or investigation.get("error") != "ACTION_HTTP_ERROR" or investigation.get("status") != 404 or not tickets:
+            state["stage"] = "blocked"
+            return "로트 신고와 조사 기록을 확인하지 못해 환불·안전 확인 요청을 접수할 수 없습니다."
+        request_history = [{"role": "user", "content": state["request_text"]}, {"role": "user", "content": "전액환불 요청"}, *history]
+        refund = await call_action({"operation_id": "API-29", "path_params": {}, "query": {}, "body": {"order_no": order_no, "amount": 34900, "reason": "곰팡이 수박 하자, 원결제수단 전액환불 요청"}}, "L-11", request_history, SEEN_TARGETS[sid])
+        if not isinstance(refund, dict) or refund.get("request_status") != "SUBMITTED" or refund.get("order_no") != order_no or not refund.get("refund_id"):
+            return "환불 신청을 접수하지 못했습니다. 잠시 후 다시 문의해 주세요."
+        reason = f"주문 {order_no}, 로트 {lot_id} 곰팡이 복수 신고와 조사 기록 부재. 안전 확인 및 판매자·공급 확인 요청."
+        handoff = await call_action({"operation_id": "API-35", "path_params": {}, "query": {}, "body": {"lane": "LANE2_HANDOFF", "reason": reason}}, "L-11", request_history, SEEN_TARGETS[sid])
+        if not isinstance(handoff, dict) or handoff.get("request_status") != "SUBMITTED" or not handoff.get("escalation_id"):
+            return "수박 전액환불 신청은 접수됐습니다. 로트 안전 확인 이관은 접수 확인이 필요합니다."
+        state["stage"] = "done"
+        return f"곰팡이 수박 전액환불 신청이 접수됐습니다. 동일 로트 안전 확인도 별도 접수했습니다(이관번호 {handoff['escalation_id']}). 담당자 회신 목표는 영업일 3일입니다."
+    return "처리 상태를 확인 중입니다."
+
 async def answer_question(question, sid, case_id):
     async with LOCKS[sid]:
         if case_id and CASE_IDS.get(sid) != case_id:
@@ -292,6 +379,7 @@ async def answer_question(question, sid, case_id):
             SEEN_TARGETS[sid].clear()
             ADDRESS_STATES.pop(sid, None)
             RECEIPT_STATES.pop(sid, None)
+            MOLD_STATES.pop(sid, None)
         history = SESSIONS[sid]
         history.append({"role": "user", "content": question})
         if case_id:
@@ -303,6 +391,10 @@ async def answer_question(question, sid, case_id):
             return answer
         if case_id == "L-05":
             answer = await handle_l05(question, sid, history)
+            history.append({"role": "assistant", "content": answer})
+            return answer
+        if case_id == "L-11":
+            answer = await handle_l11(question, sid, history)
             history.append({"role": "assistant", "content": answer})
             return answer
         if not os.getenv("OPENAI_API_KEY"):

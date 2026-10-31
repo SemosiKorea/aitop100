@@ -200,6 +200,64 @@ class AgentTests(unittest.TestCase):
             self.assertIn("접수할 수 없습니다", asyncio.run(main.answer_question("네", sid, None)))
             self.assertEqual([r.url.path for r in requests], ["/api/orders/100100016"])
 
+    def test_l11_refund_and_separate_lot_handoff(self):
+        requests = []
+        lot = "KD-WTM-370624-03"
+
+        def handler(request):
+            requests.append(request)
+            path = request.url.path
+            if path == "/api/shipments":
+                return httpx.Response(200, json=[{"order_no": "100100016", "status": "DELIVERED", "delivered_at": "2037-06-26T12:00:00+09:00", "items": [{"lot_id": lot}]}])
+            if path == f"/api/lots/{lot}":
+                return httpx.Response(200, json={"lot_id": lot})
+            if path.endswith("/investigation"):
+                return httpx.Response(404)
+            if path == "/api/tickets":
+                return httpx.Response(200, json=[{"lot_id": lot, "ticket_id": "T-1"}])
+            if path == "/api/refunds":
+                return httpx.Response(200, json={"order_no": "100100016", "request_status": "SUBMITTED", "refund_id": "RF-1"})
+            return httpx.Response(200, json={"request_status": "SUBMITTED", "escalation_id": "ES-1"})
+
+        original = httpx.AsyncClient
+        sid = "l11-mold"
+        main.CASE_IDS.pop(sid, None)
+        main.MOLD_STATES.pop(sid, None)
+        main.SEEN_TARGETS[sid].clear()
+        intro = "며칠 전에 받은 건데 오늘 열어보니 곰팡이가 피어 있어요."
+        with patch.dict(os.environ, {"AITOP100_ACTION_TOKEN": "test-token"}), patch.object(main.httpx, "AsyncClient", side_effect=lambda **kw: original(transport=httpx.MockTransport(handler), **kw)):
+            self.assertEqual(main.case_id_from({}, intro), "L-11")
+            self.assertIn("드시지", asyncio.run(main.answer_question(intro, sid, "L-11")))
+            self.assertIn("보관 상태", asyncio.run(main.answer_question("100100016 안 먹었고 몸에 이상 없어요", sid, None)))
+            self.assertIn("재배송", asyncio.run(main.answer_question("상자째 서늘한 곳에 뒀어요", sid, None)))
+            self.assertIn("원결제수단", asyncio.run(main.answer_question("환불 원해요", sid, None)))
+            self.assertEqual(len(requests), 0)
+            answer = asyncio.run(main.answer_question("네", sid, None))
+            self.assertIn("전액환불 신청이 접수됐습니다", answer)
+            self.assertIn("ES-1", answer)
+            self.assertEqual([(r.method, r.url.path) for r in requests], [("GET", "/api/shipments"), ("GET", f"/api/lots/{lot}"), ("GET", f"/api/lots/{lot}/investigation"), ("GET", "/api/tickets"), ("POST", "/api/refunds"), ("POST", "/api/escalations")])
+            self.assertEqual(requests[0].url.params["order_no"], "100100016")
+            self.assertEqual(__import__("json").loads(requests[4].content)["amount"], 34900)
+            self.assertTrue(all(r.headers["X-Aitop100-Test-Case-Id"] == "L-11" for r in requests))
+
+    def test_l11_symptoms_route_to_claim_without_refund(self):
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            return httpx.Response(200, json={"request_status": "SUBMITTED", "escalation_id": "CL-1"})
+
+        original = httpx.AsyncClient
+        sid = "l11-claim"
+        main.CASE_IDS.pop(sid, None)
+        main.MOLD_STATES.pop(sid, None)
+        with patch.dict(os.environ, {"AITOP100_ACTION_TOKEN": "test-token"}), patch.object(main.httpx, "AsyncClient", side_effect=lambda **kw: original(transport=httpx.MockTransport(handler), **kw)):
+            asyncio.run(main.answer_question("L-11 곰팡이 수박을 받았어요", sid, "L-11"))
+            answer = asyncio.run(main.answer_question("100100016 먹었고 복통이 있어요", sid, None))
+            self.assertIn("CL-1", answer)
+            self.assertEqual([r.url.path for r in requests], ["/api/escalations"])
+            self.assertEqual(__import__("json").loads(requests[0].content)["lane"], "LANE3_CLAIM")
+
 
 if __name__ == "__main__":
     unittest.main()
