@@ -70,13 +70,13 @@ async def process_message(question: str, callback_token: str) -> None:
 async def webhook(
     request: Request,
     background_tasks: BackgroundTasks,
-    x_kakao_webhook_secret: str | None = Header(default=None),
+    x_kakao_secret: str | None = Header(default=None),
 ):
     expected = os.getenv("KAKAO_WEBHOOK_SECRET")
     if not expected:
         raise HTTPException(status_code=503, detail="Webhook secret is not configured")
-    if not x_kakao_webhook_secret or not secrets.compare_digest(
-        x_kakao_webhook_secret, expected
+    if not x_kakao_secret or not secrets.compare_digest(
+        x_kakao_secret, expected
     ):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
