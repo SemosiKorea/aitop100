@@ -135,6 +135,54 @@ class AgentTests(unittest.TestCase):
             self.assertIn("접수하지 못했습니다", asyncio.run(main.answer_question("네", sid, None)))
             self.assertEqual([r.method for r in requests], ["GET", "POST"])
 
+    def test_l05_receipt_only_for_selected_cash_order(self):
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            if request.url.path == "/api/orders/100100003":
+                return httpx.Response(200, json={"order_no": "100100003", "status": "PAID", "payment_refs": ["PAY-3706-0003"]})
+            if request.url.path == "/api/payments/PAY-3706-0003":
+                return httpx.Response(200, json={"approval_no": "PAY-3706-0003", "order_no": "100100003", "pay_method": "BANK_TRANSFER", "status": "APPROVED", "paid_at": "2037-06-23T15:00:00+09:00", "amount": 34900})
+            return httpx.Response(200, json={"approval_no": "PAY-3706-0003", "request_status": "SUBMITTED", "request_id": "CR-1"})
+
+        original = httpx.AsyncClient
+        sid = "l05-cash"
+        main.CASE_IDS.pop(sid, None)
+        main.RECEIPT_STATES.pop(sid, None)
+        main.SEEN_TARGETS[sid].clear()
+        intro = "지난주 주문건 현금영수증 처리 부탁드립니다. 019-2314-9701로 발행해주세요."
+        with patch.dict(os.environ, {"AITOP100_ACTION_TOKEN": "test-token"}), patch.object(main.httpx, "AsyncClient", side_effect=lambda **kw: original(transport=httpx.MockTransport(handler), **kw)):
+            self.assertEqual(main.case_id_from({}, intro), "L-05")
+            self.assertIn("주문번호", asyncio.run(main.answer_question(intro, sid, "L-05")))
+            self.assertIn("발행 구분", asyncio.run(main.answer_question("100100003 무통장으로 낸 건", sid, None)))
+            self.assertIn("100100003", asyncio.run(main.answer_question("소득공제용", sid, None)))
+            self.assertEqual(len(requests), 0)
+            answer = asyncio.run(main.answer_question("네", sid, None))
+            self.assertIn("발행 요청이 접수됐습니다", answer)
+            self.assertEqual([r.url.path for r in requests], ["/api/orders/100100003", "/api/payments/PAY-3706-0003", "/api/payments/PAY-3706-0003/cash-receipt-requests"])
+            self.assertTrue(all(r.headers["X-Aitop100-Test-Case-Id"] == "L-05" for r in requests))
+            self.assertEqual(__import__("json").loads(requests[-1].content), {"receipt_number": "019-2314-9701"})
+
+    def test_l05_card_payment_never_submits_receipt(self):
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            if request.url.path.startswith("/api/orders/"):
+                return httpx.Response(200, json={"order_no": "100100003", "status": "PAID", "payment_refs": ["PAY-3706-0003"]})
+            return httpx.Response(200, json={"approval_no": "PAY-3706-0003", "order_no": "100100003", "pay_method": "CARD", "status": "APPROVED"})
+
+        original = httpx.AsyncClient
+        sid = "l05-card"
+        main.CASE_IDS.pop(sid, None)
+        main.RECEIPT_STATES.pop(sid, None)
+        with patch.dict(os.environ, {"AITOP100_ACTION_TOKEN": "test-token"}), patch.object(main.httpx, "AsyncClient", side_effect=lambda **kw: original(transport=httpx.MockTransport(handler), **kw)):
+            asyncio.run(main.answer_question("L-05 지난주 주문건 현금영수증 발행해주세요. 019-2314-9701", sid, "L-05"))
+            asyncio.run(main.answer_question("100100003 소득공제용", sid, None))
+            self.assertIn("접수할 수 없습니다", asyncio.run(main.answer_question("네", sid, None)))
+            self.assertEqual([r.method for r in requests], ["GET", "GET"])
+
 
 if __name__ == "__main__":
     unittest.main()

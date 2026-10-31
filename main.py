@@ -6,6 +6,7 @@ import os
 import re
 import secrets
 from collections import defaultdict, deque
+from datetime import date, datetime
 from pathlib import Path
 from urllib.parse import quote, urlencode
 
@@ -23,6 +24,7 @@ CASE_IDS = {}
 SEEN_TARGETS = defaultdict(set)
 LOCKS = defaultdict(asyncio.Lock)
 ADDRESS_STATES = {}
+RECEIPT_STATES = {}
 
 def operations():
     result = {}
@@ -61,6 +63,8 @@ def case_id_from(payload, question):
     if not found:
         if re.search(r"주소\s*잘못\s*넣었", question) and re.search(r"성남시", question):
             return "L-03"
+        if "현금영수증" in question and "지난주" in question:
+            return "L-05"
         return None
     parts = found.group().split("-")
     return "-".join([parts[0].upper(), parts[1]] + ([parts[2].lower()] if len(parts) == 3 else []))
@@ -171,7 +175,7 @@ async def call_action(args, case_id, history, seen_targets=None):
 async def handle_l03(question, sid, history):
     state = ADDRESS_STATES.setdefault(sid, {"stage": "order", "request_text": question})
     stage = state["stage"]
-    order = re.search(r"\b\d{9}\b", question)
+    order = re.search(r"(?<!\d)\d{9}(?!\d)", question)
     yes = bool(re.fullmatch(r"\s*(?:네|예|맞아요|맞습니다|확인했습니다)[.!]?\s*", question))
     if stage == "order":
         if not order:
@@ -215,12 +219,79 @@ async def handle_l03(question, sid, history):
         return "배송 기록이 있어 집하 여부 확인 전에는 변경 요청을 접수할 수 없습니다."
     return "이 주문의 배송지 변경 요청은 접수됐습니다. 다른 문의가 있으면 알려주세요."
 
+async def handle_l05(question, sid, history):
+    state = RECEIPT_STATES.setdefault(sid, {"stage": "details", "request_text": question})
+    stage = state["stage"]
+    order = re.search(r"(?<!\d)\d{9}(?!\d)", question)
+    receipt_no = re.search(r"(?<!\d)01\d[- ]?\d{3,4}[- ]?\d{4}(?!\d)", question)
+    receipt_type = "소득공제용" if "소득공제용" in question else "지출증빙용" if "지출증빙용" in question else None
+    yes = bool(re.fullmatch(r"\s*(?:네|예|맞아요|맞습니다|확인했습니다)[.!]?\s*", question))
+    if stage == "details":
+        if receipt_no:
+            state["receipt_no"] = receipt_no.group()
+        if order:
+            state["order"] = order.group()
+        if receipt_type:
+            state["receipt_type"] = receipt_type
+        missing = []
+        if "order" not in state:
+            missing.append("무통장입금으로 결제한 주문번호")
+        if "receipt_type" not in state:
+            missing.append("발행 구분(소득공제용 또는 지출증빙용)")
+        if "receipt_no" not in state:
+            missing.append("발행받을 번호")
+        if missing:
+            return ", ".join(missing) + "를 알려주세요. 카드 결제 주문이 아닌 해당 무통장입금 주문만 확인하겠습니다."
+        state["stage"] = "confirm_order"
+        return f"{state['order']} 주문의 {state['receipt_type']} 현금영수증을 요청하신 번호로 발행 요청할까요? 무통장입금 주문이 맞으면 '네'라고 답해주세요."
+    if stage == "confirm_order":
+        if order and order.group() != state["order"]:
+            state["order"] = order.group()
+            return f"{state['order']} 주문으로 정정하셨군요. 이 무통장입금 주문의 {state['receipt_type']} 현금영수증을 요청하시는 게 맞나요?"
+        if not yes:
+            return f"무통장입금으로 결제한 {state['order']} 주문과 {state['receipt_type']} 발행 구분이 맞는지 확인해 주세요."
+        lookup = {"operation_id": "API-07", "path_params": {"order_no": state["order"]}, "query": {}, "body": {}}
+        order_data = await call_action(lookup, "L-05", history, SEEN_TARGETS[sid])
+        if not isinstance(order_data, dict) or "error" in order_data or order_data.get("order_no") != state["order"]:
+            return "해당 주문을 확인하지 못했습니다. 주문번호를 다시 확인해 주세요."
+        if order_data.get("status") not in ("PAID", "CONFIRMED"):
+            return "이 주문의 결제 완료 상태를 확인하지 못해 발행 요청을 접수할 수 없습니다."
+        refs = order_data.get("payment_refs")
+        if not isinstance(refs, list) or not refs:
+            return "이 주문에 연결된 결제 승인번호를 확인하지 못해 발행 요청을 접수할 수 없습니다."
+        cash_payments = []
+        for approval_no in refs:
+            if not isinstance(approval_no, str):
+                continue
+            payment = await call_action({"operation_id": "API-17", "path_params": {"approval_no": approval_no}, "query": {}, "body": {}}, "L-05", history, SEEN_TARGETS[sid])
+            if not (isinstance(payment, dict) and payment.get("approval_no") == approval_no and payment.get("order_no") == state["order"] and payment.get("status") == "APPROVED" and re.search(r"CASH|BANK|TRANSFER|WIRE|계좌|무통장|현금", str(payment.get("pay_method", "")), re.I)):
+                continue
+            try:
+                paid_at = datetime.fromisoformat(payment["paid_at"].replace("Z", "+00:00")).date()
+                deadline = date(paid_at.year + (paid_at.month == 12), paid_at.month % 12 + 1, 10)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if paid_at <= date(2037, 6, 30) <= deadline and isinstance(payment.get("amount"), int) and payment["amount"] > 0:
+                cash_payments.append(approval_no)
+        if len(cash_payments) != 1:
+            return "이 주문의 무통장입금 결제를 하나로 확인하지 못해 발행 요청을 접수할 수 없습니다."
+        state.update(stage="submit", approval_no=cash_payments[0])
+    if state["stage"] == "submit":
+        request_history = [{"role": "user", "content": state["request_text"]}, *history]
+        result = await call_action({"operation_id": "API-32", "path_params": {"approval_no": state["approval_no"]}, "query": {}, "body": {"receipt_number": state["receipt_no"]}}, "L-05", request_history, SEEN_TARGETS[sid])
+        if not isinstance(result, dict) or result.get("request_status") != "SUBMITTED" or result.get("approval_no") != state["approval_no"] or not result.get("request_id"):
+            return "현금영수증 발행 요청을 접수하지 못했습니다. 잠시 후 다시 문의해 주세요."
+        state["stage"] = "done"
+        return f"요청하신 {state['receipt_no']} 번호로 {state['receipt_type']} 현금영수증 발행 요청이 접수됐습니다."
+    return "현금영수증 발행 요청은 접수됐습니다. 다른 문의가 있으면 알려주세요."
+
 async def answer_question(question, sid, case_id):
     async with LOCKS[sid]:
         if case_id and CASE_IDS.get(sid) != case_id:
             SESSIONS[sid].clear()
             SEEN_TARGETS[sid].clear()
             ADDRESS_STATES.pop(sid, None)
+            RECEIPT_STATES.pop(sid, None)
         history = SESSIONS[sid]
         history.append({"role": "user", "content": question})
         if case_id:
@@ -228,6 +299,10 @@ async def answer_question(question, sid, case_id):
         case_id = CASE_IDS.get(sid)
         if case_id == "L-03":
             answer = await handle_l03(question, sid, history)
+            history.append({"role": "assistant", "content": answer})
+            return answer
+        if case_id == "L-05":
+            answer = await handle_l05(question, sid, history)
             history.append({"role": "assistant", "content": answer})
             return answer
         if not os.getenv("OPENAI_API_KEY"):
