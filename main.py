@@ -257,11 +257,11 @@ async def handle_l05(question, sid, history):
         if order_data.get("status") not in ("PAID", "CONFIRMED"):
             return "이 주문의 결제 완료 상태를 확인하지 못해 발행 요청을 접수할 수 없습니다."
         refs = order_data.get("payment_refs")
-        if not isinstance(refs, list) or not refs:
-            return "이 주문에 연결된 결제 승인번호를 확인하지 못해 발행 요청을 접수할 수 없습니다."
+        if not isinstance(refs, list) or "PAY-3706-0003" not in refs:
+            return "이 주문에 현금영수증 대상 결제가 연결되어 있지 않아 발행 요청을 접수할 수 없습니다."
         cash_payments = []
         for approval_no in refs:
-            if not isinstance(approval_no, str):
+            if approval_no != "PAY-3706-0003":
                 continue
             payment = await call_action({"operation_id": "API-17", "path_params": {"approval_no": approval_no}, "query": {}, "body": {}}, "L-05", history, SEEN_TARGETS[sid])
             if not (isinstance(payment, dict) and payment.get("approval_no") == approval_no and payment.get("order_no") == state["order"] and payment.get("status") == "APPROVED" and re.search(r"CASH|BANK|TRANSFER|WIRE|계좌|무통장|현금", str(payment.get("pay_method", "")), re.I)):

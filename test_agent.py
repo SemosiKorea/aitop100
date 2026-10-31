@@ -183,6 +183,23 @@ class AgentTests(unittest.TestCase):
             self.assertIn("접수할 수 없습니다", asyncio.run(main.answer_question("네", sid, None)))
             self.assertEqual([r.method for r in requests], ["GET", "GET"])
 
+    def test_l05_different_approval_never_submits_receipt(self):
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            return httpx.Response(200, json={"order_no": "100100016", "status": "PAID", "payment_refs": ["PAY-3706-9999"]})
+
+        original = httpx.AsyncClient
+        sid = "l05-wrong-order"
+        main.CASE_IDS.pop(sid, None)
+        main.RECEIPT_STATES.pop(sid, None)
+        with patch.dict(os.environ, {"AITOP100_ACTION_TOKEN": "test-token"}), patch.object(main.httpx, "AsyncClient", side_effect=lambda **kw: original(transport=httpx.MockTransport(handler), **kw)):
+            asyncio.run(main.answer_question("L-05 지난주 주문건 현금영수증 발행해주세요. 019-2314-9701", sid, "L-05"))
+            asyncio.run(main.answer_question("100100016 소득공제용", sid, None))
+            self.assertIn("접수할 수 없습니다", asyncio.run(main.answer_question("네", sid, None)))
+            self.assertEqual([r.url.path for r in requests], ["/api/orders/100100016"])
+
 
 if __name__ == "__main__":
     unittest.main()
