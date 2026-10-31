@@ -22,6 +22,7 @@ SESSIONS = defaultdict(lambda: deque(maxlen=12))
 CASE_IDS = {}
 SEEN_TARGETS = defaultdict(set)
 LOCKS = defaultdict(asyncio.Lock)
+ADDRESS_STATES = {}
 
 def operations():
     result = {}
@@ -58,6 +59,8 @@ def case_id_from(payload, question):
         return explicit.group(1)
     found = re.search(r"\b(?:L|R|Y)-\d{2}(?:-[a-z])?\b", question, re.I)
     if not found:
+        if re.search(r"주소\s*잘못\s*넣었", question) and re.search(r"성남시", question):
+            return "L-03"
         return None
     parts = found.group().split("-")
     return "-".join([parts[0].upper(), parts[1]] + ([parts[2].lower()] if len(parts) == 3 else []))
@@ -135,7 +138,7 @@ async def call_action(args, case_id, history, seen_targets=None):
         if args.get("operation_id") == "API-35":
             if body.get("lane") not in ("LANE2_HANDOFF", "LANE3_CLAIM"):
                 return {"error": "INVALID_LANE"}
-        elif not re.search(r"(환불|취소|변경|발급|요청|신청|접수|재배송|알림|보상|해\s*주세요|부탁)", utterances):
+        elif not re.search(r"(환불|취소|변경|바꿔|고쳐|수정|발급|요청|신청|접수|재배송|알림|보상|해\s*주세요|부탁)", utterances):
             return {"error": "CUSTOMER_REQUEST_REQUIRED"}
         if args.get("operation_id") == "API-29" and (type(body.get("amount")) is not int or body["amount"] <= 0):
             return {"error": "INVALID_AMOUNT"}
@@ -155,6 +158,9 @@ async def call_action(args, case_id, history, seen_targets=None):
             result = redact(response.json())
             if method == "GET" and seen_targets is not None:
                 collect_targets(result, seen_targets)
+                # A successful shipment search can return [] for an order before pickup.
+                if case_id == "L-03" and args.get("operation_id") == "API-11" and isinstance(result, list):
+                    seen_targets.add(query["order_no"])
             if method == "POST":
                 log.info("Action submitted: %s case=%s", args["operation_id"], case_id)
             return result
@@ -162,18 +168,63 @@ async def call_action(args, case_id, history, seen_targets=None):
             log.exception("Action API failure")
             return {"error": "ACTION_UNAVAILABLE"}
 
+async def handle_l03(question, sid, history):
+    state = ADDRESS_STATES.setdefault(sid, {"stage": "order"})
+    stage = state["stage"]
+    order = re.search(r"\b\d{9}\b", question)
+    yes = bool(re.search(r"(^|\s)(네|예|맞아요|맞습니다|확인했습니다)(\s|[.!?]|$)", question))
+    if stage == "order":
+        if not order:
+            return "배송지를 변경할 9자리 주문번호를 알려주세요. 그 주문의 배송지를 바꾸려는 게 맞는지도 확인해 주세요."
+        state.update(stage="confirm_order", order=order.group())
+        return f"{state['order']} 주문의 배송지를 변경하려는 게 맞나요? 맞으면 '네'라고 답해주세요."
+    if stage == "confirm_order":
+        if order and order.group() != state["order"]:
+            state["order"] = order.group()
+            return f"{state['order']} 주문으로 정정하셨군요. 이 주문의 배송지를 변경하려는 게 맞나요?"
+        if not yes:
+            return f"변경 대상이 {state['order']} 주문이 맞는지 확인해 주세요. 다른 주문이면 번호를 알려주세요."
+        result = await call_action({"operation_id": "API-11", "path_params": {}, "query": {"order_no": state["order"]}, "body": {}}, "L-03", history, SEEN_TARGETS[sid])
+        if isinstance(result, dict) and "error" in result:
+            return "배송 상태를 조회하지 못했습니다. 잠시 후 다시 확인해 주세요."
+        if not isinstance(result, list) or result:
+            return "이 주문에는 배송 기록이 있어 집하 여부를 더 확인해야 합니다. 확인 전에는 배송지 변경을 접수할 수 없습니다."
+        state["stage"] = "address"
+        return "아직 배송 건이 없어 집하 전으로 확인됩니다. 변경할 주소를 시·구, 도로명 또는 지번, 건물번호와 동·호수까지 알려주세요."
+    if stage == "address":
+        address = question.strip()
+        if len(address) < 15 or not re.search(r"\d", address) or not re.search(r"(로|길|동|번지)", address):
+            return "'경기 성남시'만으로는 접수할 수 없습니다. 시·구, 도로명 또는 지번, 건물번호와 동·호수까지 알려주세요."
+        state.update(stage="confirm_address", address=address)
+        return f"{state['order']} 주문의 배송지를 '{address}'로 변경 요청할까요? 주소가 맞으면 '네'라고 답해주세요."
+    if stage == "confirm_address":
+        if not yes:
+            state["stage"] = "address"
+            return "변경할 상세주소를 다시 알려주세요."
+        result = await call_action({"operation_id": "API-24", "path_params": {"order_no": state["order"]}, "query": {}, "body": {"new_address": state["address"]}}, "L-03", history, SEEN_TARGETS[sid])
+        if isinstance(result, dict) and "error" in result:
+            return "배송지 변경 요청을 접수하지 못했습니다. 잠시 후 다시 문의해 주세요."
+        state["stage"] = "done"
+        return f"{state['order']} 주문의 배송지를 '{state['address']}'로 변경하는 요청이 접수됐습니다."
+    return "이 주문의 배송지 변경 요청은 접수됐습니다. 다른 문의가 있으면 알려주세요."
+
 async def answer_question(question, sid, case_id):
-    if not os.getenv("OPENAI_API_KEY"):
-        return "상담 서비스 설정을 확인 중입니다. 잠시 후 다시 문의해 주세요."
     async with LOCKS[sid]:
         if case_id and CASE_IDS.get(sid) != case_id:
             SESSIONS[sid].clear()
             SEEN_TARGETS[sid].clear()
+            ADDRESS_STATES.pop(sid, None)
         history = SESSIONS[sid]
         history.append({"role": "user", "content": question})
         if case_id:
             CASE_IDS[sid] = case_id
         case_id = CASE_IDS.get(sid)
+        if case_id == "L-03":
+            answer = await handle_l03(question, sid, history)
+            history.append({"role": "assistant", "content": answer})
+            return answer
+        if not os.getenv("OPENAI_API_KEY"):
+            return "상담 서비스 설정을 확인 중입니다. 잠시 후 다시 문의해 주세요."
         inputs = list(history)
         instruction = POLICY + "\n평가 TC ID: " + (case_id or "미확인") + "\n\nAPI 목록:\n" + CATALOG + "\n\n정책 근거:\n" + selected_knowledge(" ".join(h["content"] for h in history))
         client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=35.0)

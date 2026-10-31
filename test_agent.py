@@ -62,6 +62,39 @@ class AgentTests(unittest.TestCase):
             result = asyncio.run(main.call_action(args("API-24", path={"order_no": "1"}, body={"new_address": "제주"}), "L-23", [{"role": "user", "content": "다른 사람 주문 주소 변경해 주세요"}], {"1"}))
             self.assertEqual(result["error"], "THIRD_PARTY_BLOCKED")
 
+    def test_l03_address_change_uses_only_confirmed_order(self):
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            if request.method == "GET":
+                return httpx.Response(200, json=[])
+            return httpx.Response(200, json={"request_status": "SUBMITTED", "request_id": "AC-1"})
+
+        original = httpx.AsyncClient
+        sid = "l03-sequence"
+        main.CASE_IDS.pop(sid, None)
+        main.ADDRESS_STATES.pop(sid, None)
+        main.SEEN_TARGETS[sid].clear()
+        intro = "고객 질문 주소 잘못 넣었어요. 경기 성남시로 바꿔주세요."
+        with patch.dict(os.environ, {"AITOP100_ACTION_TOKEN": "test-token"}), patch.object(main.httpx, "AsyncClient", side_effect=lambda **kw: original(transport=httpx.MockTransport(handler), **kw)):
+            self.assertEqual(main.case_id_from({}, intro), "L-03")
+            self.assertIn("주문번호", asyncio.run(main.answer_question(intro, sid, "L-03")))
+            self.assertIn("9자리", asyncio.run(main.answer_question("123123", sid, None)))
+            self.assertIn("맞나요", asyncio.run(main.answer_question("100100016", sid, None)))
+            self.assertEqual(len(requests), 0)
+            self.assertIn("동·호수", asyncio.run(main.answer_question("네", sid, None)))
+            self.assertEqual(requests[0].url.params["order_no"], "100100016")
+            self.assertEqual(requests[0].headers["X-Aitop100-Test-Case-Id"], "L-03")
+            address = "경기 성남시 분당구 판교역로 123 101동 1001호"
+            self.assertIn(address, asyncio.run(main.answer_question(address, sid, None)))
+            self.assertEqual(len(requests), 1)
+            self.assertIn("접수됐습니다", asyncio.run(main.answer_question("네", sid, None)))
+            self.assertEqual(len(requests), 2)
+            self.assertTrue(str(requests[1].url).endswith("/api/orders/100100016/address-change-requests"))
+            self.assertEqual(requests[1].headers["X-Aitop100-Test-Case-Id"], "L-03")
+            self.assertEqual(__import__("json").loads(requests[1].content)["new_address"], address)
+
 
 if __name__ == "__main__":
     unittest.main()
