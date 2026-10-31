@@ -24,6 +24,7 @@ class AgentTests(unittest.TestCase):
     def test_case_id_and_reset_allowlist(self):
         self.assertEqual(main.case_id_from({"d": {}}, "사례 R-05-a"), "R-05-a")
         self.assertNotIn("resetMyActionData", main.OPS)
+        self.assertEqual(main.sender_id({"id": 3, "botUserKey": "buk-1"}), "buk-1")
 
     def test_read_target_then_exact_refund(self):
         requests = []
