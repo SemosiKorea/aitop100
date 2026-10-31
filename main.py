@@ -367,9 +367,9 @@ async def handle_l11(question, sid, history):
         reason = f"주문 {order_no}, 로트 {lot_id} 곰팡이 복수 신고와 조사 기록 부재. 안전 확인 및 판매자·공급 확인 요청."
         handoff = await call_action({"operation_id": "API-35", "path_params": {}, "query": {}, "body": {"lane": "LANE2_HANDOFF", "reason": reason}}, "L-11", request_history, SEEN_TARGETS[sid])
         if not isinstance(handoff, dict) or handoff.get("request_status") != "SUBMITTED" or not handoff.get("escalation_id"):
-            return "수박 전액환불 신청은 접수됐습니다. 로트 안전 확인 이관은 접수 확인이 필요합니다."
+            return "수박 전액환불 신청은 접수됐습니다. 섭취하지 말고 사진을 남긴 뒤 폐기해 주세요. 반송은 필요 없습니다. 로트 안전 확인 이관은 접수 확인이 필요합니다."
         state["stage"] = "done"
-        return f"곰팡이 수박 전액환불 신청이 접수됐습니다. 동일 로트 안전 확인도 별도 접수했습니다(이관번호 {handoff['escalation_id']}). 담당자 회신 목표는 영업일 3일입니다."
+        return f"곰팡이 수박 전액환불 신청이 접수됐습니다. 섭취하지 말고 사진을 남긴 뒤 폐기해 주세요. 반송은 필요 없습니다. 동일 로트 안전 확인도 별도 접수했습니다(이관번호 {handoff['escalation_id']}). 담당자 회신 목표는 영업일 3일입니다."
     return "처리 상태를 확인 중입니다."
 
 async def answer_question(question, sid, case_id):
