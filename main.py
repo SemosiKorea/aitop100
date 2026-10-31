@@ -53,6 +53,9 @@ def case_id_from(payload, question):
                 value = obj.get(key)
                 if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}", value):
                     return value
+    explicit = re.search(r"(?:TC\s*ID|TC_ID|사례\s*ID)\s*[:：]?\s*([A-Za-z0-9][A-Za-z0-9._-]{0,99})", question, re.I)
+    if explicit:
+        return explicit.group(1)
     found = re.search(r"\b(?:L|R|Y)-\d{2}(?:-[a-z])?\b", question, re.I)
     if not found:
         return None
@@ -163,6 +166,9 @@ async def answer_question(question, sid, case_id):
     if not os.getenv("OPENAI_API_KEY"):
         return "상담 서비스 설정을 확인 중입니다. 잠시 후 다시 문의해 주세요."
     async with LOCKS[sid]:
+        if case_id and CASE_IDS.get(sid) != case_id:
+            SESSIONS[sid].clear()
+            SEEN_TARGETS[sid].clear()
         history = SESSIONS[sid]
         history.append({"role": "user", "content": question})
         if case_id:
@@ -191,7 +197,7 @@ async def answer_question(question, sid, case_id):
 
 async def process_message(question, callback_token, sid, case_id):
     try:
-        answer = await answer_question(question, sid, case_id)
+        answer = await asyncio.wait_for(answer_question(question, sid, case_id), timeout=52)
     except Exception:
         log.exception("Agent failed")
         answer = "문의 처리 중 일시적인 문제가 발생했습니다. 잠시 후 다시 보내주세요."
