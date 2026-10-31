@@ -169,10 +169,10 @@ async def call_action(args, case_id, history, seen_targets=None):
             return {"error": "ACTION_UNAVAILABLE"}
 
 async def handle_l03(question, sid, history):
-    state = ADDRESS_STATES.setdefault(sid, {"stage": "order"})
+    state = ADDRESS_STATES.setdefault(sid, {"stage": "order", "request_text": question})
     stage = state["stage"]
     order = re.search(r"\b\d{9}\b", question)
-    yes = bool(re.search(r"(^|\s)(네|예|맞아요|맞습니다|확인했습니다)(\s|[.!?]|$)", question))
+    yes = bool(re.fullmatch(r"\s*(?:네|예|맞아요|맞습니다|확인했습니다)[.!]?\s*", question))
     if stage == "order":
         if not order:
             return "배송지를 변경할 9자리 주문번호를 알려주세요. 그 주문의 배송지를 바꾸려는 게 맞는지도 확인해 주세요."
@@ -188,12 +188,16 @@ async def handle_l03(question, sid, history):
         if isinstance(result, dict) and "error" in result:
             return "배송 상태를 조회하지 못했습니다. 잠시 후 다시 확인해 주세요."
         if not isinstance(result, list) or result:
+            state["stage"] = "blocked"
             return "이 주문에는 배송 기록이 있어 집하 여부를 더 확인해야 합니다. 확인 전에는 배송지 변경을 접수할 수 없습니다."
         state["stage"] = "address"
         return "아직 배송 건이 없어 집하 전으로 확인됩니다. 변경할 주소를 시·구, 도로명 또는 지번, 건물번호와 동·호수까지 알려주세요."
     if stage == "address":
         address = question.strip()
-        if len(address) < 15 or not re.search(r"\d", address) or not re.search(r"(로|길|동|번지)", address):
+        street_or_lot = re.search(r"\S+(?:로|길)\s*\d+(?:-\d+)?|\S+동\s+\d+(?:-\d+)?", address)
+        building_and_unit = re.search(r"(?:\d+|[A-Za-z])동\b", address) and re.search(r"\d+호\b", address)
+        full_area = re.search(r"경기(?:도)?\s+성남시\s+\S+구\b", address)
+        if not (full_area and street_or_lot and building_and_unit):
             return "'경기 성남시'만으로는 접수할 수 없습니다. 시·구, 도로명 또는 지번, 건물번호와 동·호수까지 알려주세요."
         state.update(stage="confirm_address", address=address)
         return f"{state['order']} 주문의 배송지를 '{address}'로 변경 요청할까요? 주소가 맞으면 '네'라고 답해주세요."
@@ -201,11 +205,14 @@ async def handle_l03(question, sid, history):
         if not yes:
             state["stage"] = "address"
             return "변경할 상세주소를 다시 알려주세요."
-        result = await call_action({"operation_id": "API-24", "path_params": {"order_no": state["order"]}, "query": {}, "body": {"new_address": state["address"]}}, "L-03", history, SEEN_TARGETS[sid])
-        if isinstance(result, dict) and "error" in result:
+        request_history = [{"role": "user", "content": state["request_text"]}, *history]
+        result = await call_action({"operation_id": "API-24", "path_params": {"order_no": state["order"]}, "query": {}, "body": {"new_address": state["address"]}}, "L-03", request_history, SEEN_TARGETS[sid])
+        if not isinstance(result, dict) or result.get("request_status") != "SUBMITTED" or result.get("order_no") != state["order"] or not result.get("request_id"):
             return "배송지 변경 요청을 접수하지 못했습니다. 잠시 후 다시 문의해 주세요."
         state["stage"] = "done"
-        return f"{state['order']} 주문의 배송지를 '{state['address']}'로 변경하는 요청이 접수됐습니다."
+        return "요청하신 배송지로 변경 요청이 접수됐습니다."
+    if stage == "blocked":
+        return "배송 기록이 있어 집하 여부 확인 전에는 변경 요청을 접수할 수 없습니다."
     return "이 주문의 배송지 변경 요청은 접수됐습니다. 다른 문의가 있으면 알려주세요."
 
 async def answer_question(question, sid, case_id):

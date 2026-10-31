@@ -69,7 +69,7 @@ class AgentTests(unittest.TestCase):
             requests.append(request)
             if request.method == "GET":
                 return httpx.Response(200, json=[])
-            return httpx.Response(200, json={"request_status": "SUBMITTED", "request_id": "AC-1"})
+            return httpx.Response(200, json={"request_status": "SUBMITTED", "request_id": "AC-1", "order_no": "100100016", "requested_at": "2037-06-30T15:16:00+09:00"})
 
         original = httpx.AsyncClient
         sid = "l03-sequence"
@@ -86,14 +86,54 @@ class AgentTests(unittest.TestCase):
             self.assertIn("동·호수", asyncio.run(main.answer_question("네", sid, None)))
             self.assertEqual(requests[0].url.params["order_no"], "100100016")
             self.assertEqual(requests[0].headers["X-Aitop100-Test-Case-Id"], "L-03")
+            self.assertIn("동·호수", asyncio.run(main.answer_question("경기 성남시 분당구 판교역로 123", sid, None)))
+            self.assertEqual(len(requests), 1)
             address = "경기 성남시 분당구 판교역로 123 101동 1001호"
             self.assertIn(address, asyncio.run(main.answer_question(address, sid, None)))
             self.assertEqual(len(requests), 1)
-            self.assertIn("접수됐습니다", asyncio.run(main.answer_question("네", sid, None)))
+            final_answer = asyncio.run(main.answer_question("네", sid, None))
+            self.assertEqual("요청하신 배송지로 변경 요청이 접수됐습니다.", final_answer)
             self.assertEqual(len(requests), 2)
             self.assertTrue(str(requests[1].url).endswith("/api/orders/100100016/address-change-requests"))
             self.assertEqual(requests[1].headers["X-Aitop100-Test-Case-Id"], "L-03")
             self.assertEqual(__import__("json").loads(requests[1].content)["new_address"], address)
+
+    def test_l03_existing_shipment_blocks_change(self):
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            return httpx.Response(200, json=[{"shipment_id": "SHP-1", "order_no": "100100016"}])
+
+        original = httpx.AsyncClient
+        sid = "l03-shipped"
+        main.CASE_IDS.pop(sid, None)
+        main.ADDRESS_STATES.pop(sid, None)
+        with patch.dict(os.environ, {"AITOP100_ACTION_TOKEN": "test-token"}), patch.object(main.httpx, "AsyncClient", side_effect=lambda **kw: original(transport=httpx.MockTransport(handler), **kw)):
+            asyncio.run(main.answer_question("L-03 주소 잘못 넣었어요. 경기 성남시로 바꿔주세요.", sid, "L-03"))
+            asyncio.run(main.answer_question("100100016", sid, None))
+            self.assertIn("접수할 수 없습니다", asyncio.run(main.answer_question("네", sid, None)))
+            self.assertIn("접수할 수 없습니다", asyncio.run(main.answer_question("경기 성남시 분당구 판교역로 123 101동 1001호", sid, None)))
+            self.assertEqual(len(requests), 1)
+
+    def test_l03_unconfirmed_receipt_is_not_reported_as_submitted(self):
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            return httpx.Response(200, json=[] if request.method == "GET" else {"request_status": "PENDING"})
+
+        original = httpx.AsyncClient
+        sid = "l03-bad-receipt"
+        main.CASE_IDS.pop(sid, None)
+        main.ADDRESS_STATES.pop(sid, None)
+        with patch.dict(os.environ, {"AITOP100_ACTION_TOKEN": "test-token"}), patch.object(main.httpx, "AsyncClient", side_effect=lambda **kw: original(transport=httpx.MockTransport(handler), **kw)):
+            asyncio.run(main.answer_question("L-03 주소 잘못 넣었어요. 경기 성남시로 바꿔주세요.", sid, "L-03"))
+            asyncio.run(main.answer_question("100100016", sid, None))
+            asyncio.run(main.answer_question("네", sid, None))
+            asyncio.run(main.answer_question("경기 성남시 분당구 판교역로 123 101동 1001호", sid, None))
+            self.assertIn("접수하지 못했습니다", asyncio.run(main.answer_question("네", sid, None)))
+            self.assertEqual([r.method for r in requests], ["GET", "POST"])
 
 
 if __name__ == "__main__":
